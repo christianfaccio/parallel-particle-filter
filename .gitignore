@@ -4,9 +4,11 @@ bin/
 *.o
 *.d
 
-# Filter output
+# Simulator / debug output
+*.pcd
 *.txt.out
+preview.png
+scene.png
 
-# Input dataset (large; ~2400 observation files).
-# Keep it out of git — document where to fetch it in the README instead.
+# Legacy landmark dataset (no longer used by the LiDAR pipeline)
 data/

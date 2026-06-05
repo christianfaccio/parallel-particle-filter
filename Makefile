@@ -22,7 +22,7 @@ CC       := cc
 CSTD     := -std=c11
 WARN     := -Wall -Wextra
 OPT      := -O3 -march=native
-CPPFLAGS := -Iinclude
+CPPFLAGS := -Iinclude -Ithird_party/lidarsim
 CFLAGS   := $(CSTD) $(WARN) $(OPT)
 LDLIBS   := -lm
 

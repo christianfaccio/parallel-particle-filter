@@ -1,196 +1,207 @@
 /*
- * Main function.
- * Reads data and runs the 2D particle filter.
+ * main.c — 6-DOF LiDAR Monte-Carlo Localization driver.
  *
- * C port of the original main.cpp (Udacity "kidnapped vehicle" project).
- * Differences from the C++ reference:
- *   - std::vector<T>            -> T* + int count (allocated by the readers)
- *   - default_random_engine /  -> rand_normal() (Box-Muller on rand())
- *     normal_distribution<>
- *   - ostringstream filename    -> snprintf()
- *   - getError() returns        -> getError() writes into a caller-owned error[3]
- *     a static buffer
+ * Everything is simulated, so ground-truth poses are known exactly:
+ *   1. build a ground-truth world (lidarsim primitives) and a LiDAR pattern;
+ *   2. build the localization map (reference cloud -> 3D distance field) once;
+ *   3. fly a scripted 6-DOF trajectory; at each step simulate a noisy scan and
+ *      run predict -> update -> resample -> estimate;
+ *   4. report the trajectory error (ATE) against ground truth.
+ *
+ * Usage: pf_serial [num_particles] [num_steps] [n_az] [n_el]
  */
 
-#include "helper_functions.h"
+#include "pose.h"
+#include "world.h"
+#include "lidar_map.h"
 #include "particle_filter.h"
+#include "helper_functions.h"   /* rand_normal */
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <time.h>
 
-/* The original sets this inside ParticleFilter::init; our pf_init takes it as
- * an argument, so we keep the same value here. */
-#define NUM_PARTICLES 729
-
-int main(void)
+/* Scripted ground-truth UAV pose at step t of T: a tilted circular orbit with
+ * z bob, heading-aligned yaw, and gentle roll/pitch — exercises all 6 DOF. */
+static Pose gt_pose(int t, int T)
 {
-	// Parameters related to grading.
-	int    time_steps_before_lock_required = 100;  // steps before accuracy is checked.
-	double max_runtime           = 45;             // Max allowable runtime to pass [sec]
-	double max_translation_error = 1;              // Max allowable translation error [m]
-	double max_yaw_error         = 0.05;           // Max allowable yaw error [rad]
+	double theta = 2.0 * M_PI * 1.5 * t / T;   /* 1.5 loops over the run */
+	Pose p;
+	p.pos[0] = 4.0 * cos(theta);
+	p.pos[1] = 4.0 * sin(theta);
+	p.pos[2] = 1.5 + 0.4 * sin(2.0 * theta);
+	double yaw   = theta + M_PI / 2.0;          /* tangent to the circle */
+	double pitch = 0.10 * sin(theta);
+	double roll  = 0.10 * cos(theta);
+	euler_to_quat(roll, pitch, yaw, p.quat);
+	return p;
+}
 
-	// Start timer.
-	struct timespec start, end;
-	clock_gettime(CLOCK_MONOTONIC, &start);
+static double pos_dist(const double a[3], const double b[3])
+{
+	double dx = a[0]-b[0], dy = a[1]-b[1], dz = a[2]-b[2];
+	return sqrt(dx*dx + dy*dy + dz*dz);
+}
 
-	// Set up parameters here.
-	double delta_t      = 0.1;  // Time elapsed between measurements [sec]
-	double sensor_range = 50;   // Sensor range [m]
+int main(int argc, char **argv)
+{
+	int    N      = (argc > 1) ? atoi(argv[1]) : 3000;   /* particles */
+	int    T      = (argc > 2) ? atoi(argv[2]) : 200;    /* time steps */
+	int    n_az   = (argc > 3) ? atoi(argv[3]) : 180;    /* LiDAR azimuths */
+	int    n_el   = (argc > 4) ? atoi(argv[4]) : 16;     /* LiDAR elevation rings */
 
-	/*
-	 * Sigmas - just an estimate, usually comes from sensor uncertainty.
-	 */
-	double sigma_pos[3]      = {0.3, 0.3, 0.01}; // GPS uncertainty [x [m], y [m], theta [rad]]
-	double sigma_landmark[2] = {0.3, 0.3};       // Landmark uncertainty [x [m], y [m]]
+	/* noise / model parameters */
+	const double sigma_scan = 0.02;   /* per-point sensor noise [m]         */
+	const double sigma_meas = 0.20;   /* likelihood-field Gaussian std [m]  */
+	const double init_pos_std[3] = {0.40, 0.40, 0.40};
+	const double init_rot_std[3] = {0.05, 0.05, 0.05};   /* ~3 deg */
+	const double proc_pos_std[3] = {0.03, 0.03, 0.03};
+	const double proc_rot_std[3] = {0.010, 0.010, 0.010};
+	const double odom_pos_std[3] = {0.02, 0.02, 0.02};
+	const double odom_rot_std[3] = {0.005, 0.005, 0.005};
 
-	// Read map data.
-	Map map;
-	if (!read_map_data("data/map_data.txt", &map)) {
-		printf("Error: Could not open map file\n");
+	/* pass/fail thresholds */
+	const double max_trans_err = 0.5;             /* m   */
+	const double max_rot_err   = 5.0 * M_PI/180;  /* rad */
+	const int    warmup        = 10;              /* steps excluded from the mean */
+
+	printf("6-DOF LiDAR MCL: N=%d particles, T=%d steps, LiDAR=%dx%d rays\n",
+	       N, T, n_az, n_el);
+
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+
+	/* --- world + map (built once) --- */
+	World *w = world_create(n_az, n_el);
+
+	/* Build the map with a DENSE LiDAR + many viewpoints so the distance field
+	 * approximates true distance-to-surface, then restore the runtime pattern. */
+	ScanCloud ref;
+	scancloud_init(&ref);
+	world_set_lidar(w, 720, 180);
+	lidar_map_build_cloud(w, 5, &ref);
+	world_set_lidar(w, n_az, n_el);
+
+	DistanceField df;
+	if (df_build(&df, &ref, /*voxel=*/0.15, /*pad=*/1.0) != 0) {
+		fprintf(stderr, "Error: distance-field build failed\n");
 		return -1;
 	}
+	printf("Map: reference cloud %d pts, distance field %dx%dx%d (%.2f m voxels)\n",
+	       ref.n, df.dim[0], df.dim[1], df.dim[2], df.voxel);
 
-	// Read control/position data (the readers allocate the arrays).
-	control_s *position_meas = NULL;
-	int count_control_data   = 0;
-	if (!read_control_data("data/control_data.txt", &position_meas, &count_control_data)) {
-		printf("Error: Could not open position/control measurement file\n");
-		return -1;
-	}
+	struct timespec tmap;
+	clock_gettime(CLOCK_MONOTONIC, &tmap);
 
-	// Read ground truth data.
-	ground_truth *gt   = NULL;
-	int count_gt_data  = 0;
-	if (!read_gt_data("data/gt_data.txt", &gt, &count_gt_data)) {
-		printf("Error: Could not open ground truth data file\n");
-		return -1;
-	}
-
-	// Run the particle filter.
-	int num_time_steps = count_control_data;
+	/* --- run the filter along the trajectory --- */
 	ParticleFilter pf = {0};
-	double total_error[3]    = {0, 0, 0};
-	double cum_mean_error[3] = {0, 0, 0};
+	ScanCloud scan;
+	scancloud_init(&scan);
 
-	for (int i = 0; i < num_time_steps; i++)
-	{
-		printf("Time step: %i\n", i);
+	double sum_trans = 0.0, sum_rot = 0.0;
+	int    counted = 0;
 
-		// Read landmark observations for the current time step.
-		char filename[128];
-		snprintf(filename, sizeof filename,
-		         "data/observation/observations_%06d.txt", i + 1);
+	/* Optional point-cloud dump for a viewer (set PF_DUMP=1). We collect the
+	 * ground-truth and estimated trajectories over the whole run, plus a single
+	 * world-frame scan and the particle cloud at one "snapshot" step. */
+	const char *dump = getenv("PF_DUMP");
+	const int   viz_step = T / 4;
+	ScanCloud gt_traj, est_traj, scan_world, particles_pc;
+	scancloud_init(&gt_traj); scancloud_init(&est_traj);
+	scancloud_init(&scan_world); scancloud_init(&particles_pc);
 
-		LandmarkObs *observations = NULL;
-		int n_observations        = 0;
-		if (!read_landmark_data(filename, &observations, &n_observations)) {
-			printf("Error: Could not open observation file %d\n", i + 1);
-			return -1;
+	for (int t = 0; t < T; t++) {
+		Pose gt = gt_pose(t, T);
+
+		/* simulate the live scan (sensor frame) + per-point noise */
+		world_scan(w, &gt, &scan);
+		for (int m = 0; m < scan.n; m++) {
+			scan.x[m] += (float)rand_normal(0.0, sigma_scan);
+			scan.y[m] += (float)rand_normal(0.0, sigma_scan);
+			scan.z[m] += (float)rand_normal(0.0, sigma_scan);
 		}
 
-		// Initialize the filter on the first time step, otherwise predict forward.
 		if (!pf_initialized(&pf)) {
-			double n_x     = rand_normal(0.0, sigma_pos[0]);
-			double n_y     = rand_normal(0.0, sigma_pos[1]);
-			double n_theta = rand_normal(0.0, sigma_pos[2]);
-			pf_init(&pf, NUM_PARTICLES,
-			        gt[i].x + n_x, gt[i].y + n_y, gt[i].theta + n_theta,
-			        sigma_pos);
+			pf_init(&pf, N, gt, init_pos_std, init_rot_std);
 		} else {
-			pf_prediction(&pf, delta_t, sigma_pos,
-			              position_meas[i - 1].velocity,
-			              position_meas[i - 1].yawrate);
+			Pose prev = gt_pose(t - 1, T);
+			Pose rel  = pose_relative(&prev, &gt);     /* control = GT motion */
+			pose_perturb(&rel, odom_pos_std, odom_rot_std); /* noisy odometry */
+			pf_prediction(&pf, rel, proc_pos_std, proc_rot_std);
 		}
 
-		// Simulate sensor noise on the (noiseless) observation data, in place.
-		for (int j = 0; j < n_observations; j++) {
-			observations[j].x += rand_normal(0.0, sigma_landmark[0]);
-			observations[j].y += rand_normal(0.0, sigma_landmark[1]);
-		}
-
-		// Update the weights and resample.
-		pf_update_weights(&pf, sensor_range, sigma_landmark,
-		                  observations, n_observations, &map);
+		pf_update_weights(&pf, &scan, &df, sigma_meas);
 		pf_resample(&pf);
 
-		// Find the highest-weight particle as the filter's best estimate.
-		double highest_weight = 0.0;
-		Particle best_particle = pf.particles[0];
-		for (int b = 0; b < pf.num_particles; b++) {
-			if (pf.particles[b].weight > highest_weight) {
-				highest_weight = pf.particles[b].weight;
-				best_particle  = pf.particles[b];
-			}
-		}
+		Pose est;
+		pf_estimate(&pf, &est);
 
-		double avg_error[3];
-		getError(gt[i].x, gt[i].y, gt[i].theta,
-		         best_particle.x, best_particle.y, best_particle.theta,
-		         avg_error);
+		double terr = pos_dist(est.pos, gt.pos);
+		double rerr = quat_geodesic(est.quat, gt.quat);
+		if (t >= warmup) { sum_trans += terr; sum_rot += rerr; counted++; }
 
-		for (int j = 0; j < 3; j++) {
-			total_error[j]    += avg_error[j];
-			cum_mean_error[j]  = total_error[j] / (double)(i + 1);
-		}
-
-		// Print the cumulative weighted error.
-		printf("Cumulative mean weighted error: x %f y %f yaw %f\n",
-		       cum_mean_error[0], cum_mean_error[1], cum_mean_error[2]);
-
-		// If the error is too high after the lock-in point, report and exit.
-		if (i >= time_steps_before_lock_required) {
-			if (cum_mean_error[0] > max_translation_error ||
-			    cum_mean_error[1] > max_translation_error ||
-			    cum_mean_error[2] > max_yaw_error) {
-				if (cum_mean_error[0] > max_translation_error) {
-					printf("Your x error, %f is larger than the maximum allowable error, %f\n",
-					       cum_mean_error[0], max_translation_error);
-				} else if (cum_mean_error[1] > max_translation_error) {
-					printf("Your y error, %f is larger than the maximum allowable error, %f\n",
-					       cum_mean_error[1], max_translation_error);
-				} else {
-					printf("Your yaw error, %f is larger than the maximum allowable error, %f\n",
-					       cum_mean_error[2], max_yaw_error);
+		if (dump) {
+			scancloud_push(&gt_traj,  (float)gt.pos[0],  (float)gt.pos[1],  (float)gt.pos[2]);
+			scancloud_push(&est_traj, (float)est.pos[0], (float)est.pos[1], (float)est.pos[2]);
+			if (t == viz_step) {
+				/* the live scan re-projected through GT -> world frame (overlays the map) */
+				for (int m = 0; m < scan.n; m++) {
+					double v[3] = { scan.x[m], scan.y[m], scan.z[m] }, wpt[3];
+					pose_transform_point(&gt, v, wpt);
+					scancloud_push(&scan_world, (float)wpt[0], (float)wpt[1], (float)wpt[2]);
 				}
-				free(observations);
-				free(position_meas);
-				free(gt);
-				free(map.landmark_list);
-				pf_free(&pf);
-				return -1;
+				for (int i = 0; i < pf.num_particles; i++)
+					scancloud_push(&particles_pc,
+					               (float)pf.particles[i].pose.pos[0],
+					               (float)pf.particles[i].pose.pos[1],
+					               (float)pf.particles[i].pose.pos[2]);
 			}
 		}
 
-		free(observations);
+		if (t % 20 == 0 || t == T - 1)
+			printf("  step %3d: scan %4d pts | trans err %.3f m | rot err %.2f deg\n",
+			       t, scan.n, terr, rerr * 180.0 / M_PI);
 	}
 
-	// End timer and report runtime.
-	clock_gettime(CLOCK_MONOTONIC, &end);
-	double runtime = (end.tv_sec - start.tv_sec) +
-	                 (end.tv_nsec - start.tv_nsec) / 1e9;  // seconds
-	printf("Runtime (sec): %f\n", runtime);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
 
-	if (runtime < max_runtime && pf_initialized(&pf)) {
-		printf("Success! Your particle filter passed!\n");
-	} else if (!pf_initialized(&pf)) {
-		printf("This is the starter code. You haven't initialized your filter.\n");
-	} else {
-		printf("Your runtime %f is larger than the maximum allowable runtime, %f\n",
-		       runtime, max_runtime);
-		free(position_meas);
-		free(gt);
-		free(map.landmark_list);
-		pf_free(&pf);
-		return -1;
+	double mean_trans = counted ? sum_trans / counted : 0.0;
+	double mean_rot   = counted ? sum_rot   / counted : 0.0;
+	double map_s = (tmap.tv_sec - t0.tv_sec) + (tmap.tv_nsec - t0.tv_nsec)/1e9;
+	double run_s = (t1.tv_sec - tmap.tv_sec) + (t1.tv_nsec - tmap.tv_nsec)/1e9;
+
+	printf("\nMean ATE (after %d-step warmup): trans %.3f m | rot %.2f deg\n",
+	       warmup, mean_trans, mean_rot * 180.0 / M_PI);
+	printf("Timing: map build %.2f s | filter %.2f s (%.1f ms/step)\n",
+	       map_s, run_s, 1000.0 * run_s / T);
+
+	int ok = (mean_trans < max_trans_err) && (mean_rot < max_rot_err);
+	printf("%s\n", ok ? "Success! Localization converged within thresholds."
+	                   : "FAIL: error above thresholds.");
+
+	if (dump) {
+		int map_stride = ref.n / 500000 + 1;   /* keep map.pcd ~<=500k points */
+		scancloud_save_pcd(&ref,          "map.pcd",        map_stride);
+		scancloud_save_pcd(&scan_world,   "scan.pcd",       1);
+		scancloud_save_pcd(&particles_pc, "particles.pcd",  1);
+		scancloud_save_pcd(&gt_traj,      "gt_traj.pcd",    1);
+		scancloud_save_pcd(&est_traj,     "est_traj.pcd",   1);
+		printf("\nWrote PCDs (step %d snapshot): map.pcd (every %dth pt), "
+		       "scan.pcd, particles.pcd, gt_traj.pcd, est_traj.pcd\n",
+		       viz_step, map_stride);
 	}
 
-	// Clean up.
-	free(position_meas);
-	free(gt);
-	free(map.landmark_list);
+	/* cleanup */
 	pf_free(&pf);
+	scancloud_free(&scan);
+	scancloud_free(&ref);
+	scancloud_free(&gt_traj);
+	scancloud_free(&est_traj);
+	scancloud_free(&scan_world);
+	scancloud_free(&particles_pc);
+	df_free(&df);
+	world_destroy(w);
 
-	return 0;
+	return ok ? 0 : 1;
 }
