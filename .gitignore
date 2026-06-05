@@ -1,0 +1,12 @@
+# Build artifacts
+build/
+bin/
+*.o
+*.d
+
+# Filter output
+*.txt.out
+
+# Input dataset (large; ~2400 observation files).
+# Keep it out of git — document where to fetch it in the README instead.
+data/
